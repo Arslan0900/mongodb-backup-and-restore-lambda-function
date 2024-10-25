@@ -1,0 +1,148 @@
+import mongoose from 'mongoose';
+import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
+import AdmZip from 'adm-zip';
+import { Readable } from 'stream';
+import https from 'https';
+
+const s3Client = new S3Client({ region: 'eu-central-1' });
+
+export const handler = async (event) => {
+  return await restoreData();
+};
+
+async function restoreData() {
+  let latestBackupFile;
+
+  try {
+    // Connect to MongoDB
+    console.log('Connecting to MongoDB...');
+    await mongoose.connect(process.env.MONGO_URI);
+    console.log('Connected to MongoDB');
+
+    // Specify the S3 bucket
+    const bucketName = process.env.BUCKET_NAME; // Use your S3 bucket name from the environment variable
+
+    // Find the latest backup file in S3
+    latestBackupFile = await findLatestBackupFile(bucketName);
+    if (!latestBackupFile) {
+      throw new Error('No backup files found in S3');
+    }
+
+    console.log(`Using latest backup file: ${latestBackupFile}`);
+
+    // Get the latest backup ZIP file from S3
+    const getObjectCommand = new GetObjectCommand({ Bucket: bucketName, Key: latestBackupFile });
+    const response = await s3Client.send(getObjectCommand);
+    const dataBuffer = await streamToBuffer(response.Body);
+
+    // Load the ZIP archive
+    const zip = new AdmZip(dataBuffer);
+    const zipEntries = zip.getEntries();
+    console.log(`Extracted ${zipEntries.length} files from the ZIP archive`);
+
+    // Iterate through the entries in the ZIP archive
+    for (const entry of zipEntries) {
+      if (!entry.isDirectory && entry.entryName.endsWith('.json')) {
+        const collectionName = entry.entryName.replace('.json', '');
+        console.log(`Restoring collection: ${collectionName}`);
+
+        // Read the JSON data from the ZIP entry
+        const jsonData = JSON.parse(entry.getData().toString('utf8'));
+
+        // Check if jsonData is an array and not empty
+        if (Array.isArray(jsonData) && jsonData.length > 0) {
+          // Clear the collection before restoring
+          const collection = mongoose.connection.db.collection(collectionName);
+          await collection.deleteMany({});
+
+          // Insert the JSON data into the MongoDB collection
+          await collection.insertMany(jsonData);
+          console.log(`Successfully restored ${collectionName}`);
+        } else {
+          console.warn(`Skipping ${collectionName}: Data is not a non-empty array`);
+        }
+      }
+    }
+
+    // Send Slack alert after successful restoration
+    await sendSlackAlert(`Database restored successfully from this S3 bucket file: ${latestBackupFile}`);
+
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ message: 'Restore completed successfully' }),
+    };
+  } catch (error) {
+    console.error('Error in Lambda function:', error);
+
+    // Send Slack alert for error
+    await sendSlackAlert(`Error during restore: ${error.message}`);
+
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ message: 'Restore failed', error: error.message }),
+    };
+  } finally {
+    await mongoose.connection.close();
+  }
+}
+
+// Function to find the latest backup file in S3
+async function findLatestBackupFile(bucketName) {
+  const listCommand = new ListObjectsV2Command({ Bucket: bucketName });
+  const data = await s3Client.send(listCommand);
+
+  if (!data.Contents || data.Contents.length === 0) {
+    return null;
+  }
+
+  // Find the latest file based on the LastModified property
+  const latestFile = data.Contents.reduce((prev, current) => {
+    return (prev.LastModified > current.LastModified) ? prev : current;
+  });
+
+  return latestFile.Key;
+}
+
+// Helper function to send a Slack alert
+async function sendSlackAlert(message) {
+  const slackWebhookUrl = process.env.slack_webhook; // Ensure this is set in your environment variables
+
+  const data = JSON.stringify({ text: message });
+
+  const options = {
+    hostname: 'hooks.slack.com',
+    path: slackWebhookUrl.split('.com')[1], // Extract path from webhook URL
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(data),
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      res.on('data', (d) => {
+        console.log(`Slack response: ${d}`);
+        resolve(d);
+      });
+    });
+
+    req.on('error', (e) => {
+      console.error('Error sending Slack alert:', e);
+      reject(e);
+    });
+
+    req.write(data);
+    req.end();
+  });
+}
+
+// Helper function to convert a readable stream to a buffer
+async function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', (chunk) => chunks.push(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+  });
+}
