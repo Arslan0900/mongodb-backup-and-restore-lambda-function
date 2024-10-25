@@ -1,0 +1,134 @@
+import mongoose from 'mongoose';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'; 
+import AdmZip from 'adm-zip'; 
+import https from 'https'; 
+
+// Initialize the S3 client
+const s3Client = new S3Client({ region: 'eu-central-1' }); 
+
+// Helper function to format the date and time as MM-DD-YYYY-HH-MM-SS
+const getCurrentDateTimeFormatted = () => {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const year = now.getFullYear();
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  return `${month}-${day}-${year}-${hours}-${minutes}-${seconds}`;
+};
+
+// Function to send a Slack message using HTTPS
+const sendSlackAlert = (message) => {
+  const webhookUrl = process.env.slack_webhook; 
+  const data = JSON.stringify({ text: message });
+  
+  const url = new URL(webhookUrl);
+  const options = {
+    hostname: url.hostname,
+    port: 443,
+    path: url.pathname,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': data.length,
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let responseData = '';
+      res.on('data', (chunk) => {
+        responseData += chunk;
+      });
+      res.on('end', () => {
+        console.log('Slack alert sent successfully:', responseData);
+        resolve(responseData);
+      });
+    });
+
+    req.on('error', (error) => {
+      console.error('Error sending Slack alert:', error);
+      reject(error);
+    });
+
+    req.write(data);
+    req.end();
+  });
+};
+
+export const handler = async (event) => {
+  try {
+    console.log("Connecting to MongoDB...");
+    const mongoUrl = process.env.MONGO_URI; 
+    console.log("MongoDB connection URL:", mongoUrl); 
+    await mongoose.connect(mongoUrl, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+    });
+    console.log("Connected to MongoDB");
+
+    // Get the list of collections from MongoDB
+    const collections = await mongoose.connection.db.listCollections().toArray();
+    console.log(`Found ${collections.length} collections.`);
+
+    // Initialize a new zip archive
+    const zip = new AdmZip();
+
+    // Loop through each collection and add its data to the zip archive in JSON format
+    for (const collection of collections) {
+      console.log(`Processing collection: ${collection.name}`);
+      const data = await mongoose.connection.db.collection(collection.name).find().toArray();
+
+      // Convert the data to JSON and create a buffer
+      const jsonBuffer = Buffer.from(JSON.stringify(data, null, 2), 'utf-8'); // Use UTF-8 encoding
+
+      // Add the JSON buffer to the zip archive
+      zip.addFile(`${collection.name}.json`, jsonBuffer);
+    }
+
+    // Generate the zip file buffer
+    const zipBuffer = zip.toBuffer();
+
+    // Get the current date and time in MM-DD-YYYY format
+    const currentDateTime = getCurrentDateTimeFormatted();
+
+    // Define parameters for the S3 PutObjectCommand to upload the zip file
+    const params = {
+      Bucket: 'gc-prod-mongodb-backup-bucket', 
+      Key: `${currentDateTime}-backup.zip`, 
+      Body: zipBuffer,
+      ContentType: 'application/zip', 
+    };
+
+    // Upload the zip file to S3
+    try {
+      const command = new PutObjectCommand(params);
+      await s3Client.send(command);
+      console.log(`Successfully uploaded ${currentDateTime}-backup.zip to S3`);
+    } catch (err) {
+      console.error(`Error uploading ${currentDateTime}-backup.zip to S3:`, err);
+    }
+
+    // Close the MongoDB connection
+    await mongoose.connection.close();
+    console.log("Closed MongoDB connection");
+
+    // Send Slack alert
+    const successMessage = `MongoDB backup completed successfully: ${currentDateTime}-backup.zip uploaded to bucket "gc-prod-mongodb-backup-bucket".`;
+    await sendSlackAlert(successMessage);
+
+    // Return a success message
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ message: successMessage }),
+    };
+  } catch (error) {
+    console.error("Error in Lambda function:", error);
+
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ message: "Backup failed", error: error.message }),
+    };
+  }
+};
